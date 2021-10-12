@@ -14,7 +14,7 @@
  * limitations under the License.
  *
  * SPDX-License-Identifier: Apache-2.0
- * Copyright (c) Steve Springett. All Rights Reserved.
+ * Copyright (c) OWASP Foundation. All Rights Reserved.
  */
 package org.cyclonedx.maven;
 
@@ -39,13 +39,21 @@ import org.apache.maven.project.DefaultProjectBuildingRequest;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.project.MavenProjectHelper;
 import org.apache.maven.project.ProjectBuildingRequest;
+import org.apache.maven.shared.dependency.analyzer.ProjectDependencyAnalysis;
+import org.apache.maven.shared.dependency.analyzer.ProjectDependencyAnalyzer;
 import org.apache.maven.shared.dependency.graph.DependencyGraphBuilder;
 import org.apache.maven.shared.dependency.graph.DependencyGraphBuilderException;
 import org.apache.maven.shared.dependency.graph.DependencyNode;
 import org.apache.maven.shared.dependency.graph.traversal.CollectingDependencyNodeVisitor;
+import org.codehaus.plexus.context.Context;
+import org.codehaus.plexus.context.ContextException;
+import org.codehaus.plexus.PlexusConstants;
+import org.codehaus.plexus.PlexusContainer;
+import org.codehaus.plexus.personality.plexus.lifecycle.phase.Contextualizable;
 import org.codehaus.plexus.util.xml.pull.XmlPullParserException;
 import org.cyclonedx.BomGeneratorFactory;
 import org.cyclonedx.CycloneDxSchema;
+import org.cyclonedx.exception.GeneratorException;
 import org.cyclonedx.generators.json.BomJsonGenerator;
 import org.cyclonedx.generators.xml.BomXmlGenerator;
 import org.cyclonedx.model.Bom;
@@ -61,6 +69,7 @@ import org.cyclonedx.parsers.XmlParser;
 import org.cyclonedx.util.BomUtils;
 import org.cyclonedx.util.LicenseResolver;
 import org.xml.sax.SAXException;
+
 import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.transform.TransformerException;
 import java.io.File;
@@ -68,8 +77,8 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.net.MalformedURLException;
-import java.net.URL;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -86,10 +95,11 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import org.apache.commons.io.input.BOMInputStream;
 
 import static org.apache.maven.artifact.Artifact.SCOPE_COMPILE;
 
-public abstract class BaseCycloneDxMojo extends AbstractMojo {
+public abstract class BaseCycloneDxMojo extends AbstractMojo implements Contextualizable {
 
     @Parameter(property = "session", readonly = true, required = true)
     private MavenSession session;
@@ -103,11 +113,14 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
     @Parameter(property = "projectType", defaultValue = "library", required = false)
     private String projectType;
 
-    @Parameter(property = "schemaVersion", defaultValue = "1.2", required = false)
+    @Parameter(property = "schemaVersion", defaultValue = "1.3", required = false)
     private String schemaVersion;
 
     @Parameter(property = "outputFormat", defaultValue = "all", required = false)
     private String outputFormat;
+
+    @Parameter(property = "outputName", defaultValue = "bom", required = false)
+    private String outputName;
 
     @Parameter(property = "includeBomSerialNumber", defaultValue = "true", required = false)
     private Boolean includeBomSerialNumber;
@@ -133,6 +146,12 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
     @Parameter(property = "excludeTypes", required = false)
     private String[] excludeTypes;
 
+    @Parameter(property = "excludeArtifactId", required = false)
+    protected String[] excludeArtifactId;
+
+    @Parameter(property = "excludeTestProject", defaultValue = "false", required = false)
+    protected Boolean excludeTestProject;
+
     @org.apache.maven.plugins.annotations.Component(hint = "default")
     private MavenProjectHelper mavenProjectHelper;
 
@@ -147,16 +166,37 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
     @Parameter(property = "cyclonedx.skipAttach", defaultValue = "false", required = false)
     private boolean skipAttach = false;
 
-
     /**
      * Various messages sent to console.
      */
     protected static final String MESSAGE_RESOLVING_DEPS = "CycloneDX: Resolving Dependencies";
     protected static final String MESSAGE_CREATING_BOM = "CycloneDX: Creating BOM";
     protected static final String MESSAGE_CALCULATING_HASHES = "CycloneDX: Calculating Hashes";
-    protected static final String MESSAGE_WRITING_BOM = "CycloneDX: Writing BOM";
-    protected static final String MESSAGE_VALIDATING_BOM = "CycloneDX: Validating BOM";
+    protected static final String MESSAGE_WRITING_BOM = "CycloneDX: Writing BOM (%s): %s";
+    protected static final String MESSAGE_VALIDATING_BOM = "CycloneDX: Validating BOM (%s): %s";
     protected static final String MESSAGE_VALIDATION_FAILURE = "The BOM does not conform to the CycloneDX BOM standard as defined by the XSD";
+
+    /**
+     * The plexus context to look-up the right {@link ProjectDependencyAnalyzer} implementation depending on the mojo
+     * configuration.
+     */
+    private Context context;
+
+    /**
+     * Specify the project dependency analyzer to use (plexus component role-hint). By default,
+     * <a href="/shared/maven-dependency-analyzer/">maven-dependency-analyzer</a> is used. To use this, you must declare
+     * a dependency for this plugin that contains the code for the analyzer. The analyzer must have a declared Plexus
+     * role name, and you specify the role name here.
+     *
+     * @since 2.2
+     */
+    @Parameter( property = "analyzer", defaultValue = "default" )
+    private String analyzer;
+
+    /**
+     * DependencyAnalyzer
+     */
+    protected ProjectDependencyAnalyzer dependencyAnalyzer;
 
     public MavenSession getSession() {
         return session;
@@ -201,6 +241,15 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
      */
     public String getOutputFormat() {
         return outputFormat;
+    }
+
+    /**
+     * Returns the CycloneDX output name that should be generated.
+     *
+     * @return the CycloneDX output name
+     */
+    public String getOutputName() {
+        return outputName;
     }
 
     /**
@@ -277,6 +326,24 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
     }
 
     /**
+     * Returns if excluded ArtifactId are defined.
+     *
+     * @return an array of excluded Artifact Id
+     */
+    public String[] getExcludeArtifactId() {
+        return excludeArtifactId;
+    }
+
+    /**
+     * Returns if project artifactId with the word test should be excluded in bom.
+     *
+     * @return true if artifactId should be excluded, otherwise false
+     */
+    protected Boolean getExcludeTestProject() {
+        return excludeTestProject;
+    }
+
+    /**
      * Returns if CycloneDX execution should be skipped.
      *
      * @return true if execution should be skipped, otherwise false
@@ -329,7 +396,7 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
         if (resolved != null) {
             try {
                 resolved.setFile(new File(resolved.getFile() + ".jar"));
-                tool.setHashes(BomUtils.calculateHashes(resolved.getFile()));
+                tool.setHashes(BomUtils.calculateHashes(resolved.getFile(), schemaVersion()));
             } catch (IOException e) {
                 getLog().warn("Unable to calculate hashes of self", e);
             }
@@ -340,11 +407,9 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
         component.setName(project.getArtifactId());
         component.setVersion(project.getVersion());
         component.setType(resolveProjectType());
-        component.setPurl(generatePackageUrl(project.getGroupId(), project.getArtifactId(), project.getVersion(), null, null));
+        component.setPurl(generatePackageUrl(project.getArtifact()));
         component.setBomRef(component.getPurl());
-        if (project.getLicenses() != null) {
-            component.setLicenseChoice(resolveMavenLicenses(project.getLicenses()));
-        }
+        extractMetadata(project, component);
         metadata.setComponent(component);
         return metadata;
     }
@@ -374,7 +439,7 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
         component.setType(Component.Type.LIBRARY);
         try {
             getLog().debug(MESSAGE_CALCULATING_HASHES);
-            component.setHashes(BomUtils.calculateHashes(artifact.getFile()));
+            component.setHashes(BomUtils.calculateHashes(artifact.getFile(), schemaVersion()));
         } catch (IOException e) {
             getLog().error("Error encountered calculating hashes", e);
         }
@@ -508,13 +573,13 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
     }
 
     private void addExternalReference(final ExternalReference.Type referenceType, final String url, final Component component) {
-        final ExternalReference ref = new ExternalReference();
-        ref.setType(referenceType);
-        ref.setUrl(url);
         try {
-            new URL(ref.getUrl());
+            final URI uri = new URI(url.trim());
+            final ExternalReference ref = new ExternalReference();
+            ref.setType(referenceType);
+            ref.setUrl(uri.toString());
             component.addExternalReference(ref);
-        } catch (MalformedURLException e) {
+        } catch (URISyntaxException e) {
             // throw it away
         }
     }
@@ -563,9 +628,9 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
                 license.setName(artifactLicense.getName().trim());
                 if (StringUtils.isNotBlank(artifactLicense.getUrl())) {
                     try {
-                        new URL(artifactLicense.getUrl());
-                        license.setUrl(artifactLicense.getUrl().trim());
-                    } catch (MalformedURLException e) {
+                        final URI uri = new URI(artifactLicense.getUrl().trim());
+                        license.setUrl(uri.toString());
+                    } catch (URISyntaxException  e) {
                         // throw it away
                     }
                 }
@@ -615,7 +680,7 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
         if (!isDescribedArtifact(artifact)) {
             return null;
         }
-        if (artifact.getFile() != null) {
+        if (artifact.getFile() != null && artifact.getFile().isFile()) {
             try {
                 final JarFile jarFile = new JarFile(artifact.getFile());
                 final JarEntry entry = jarFile.getJarEntry("META-INF/maven/"+ artifact.getGroupId() + "/" + artifact.getArtifactId() + "/pom.xml");
@@ -661,17 +726,25 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
     private MavenProject readPom(InputStream in) {
         try {
             final MavenXpp3Reader mavenreader = new MavenXpp3Reader();
-            try (final InputStreamReader reader = new InputStreamReader(in)) {
+            try (final InputStreamReader reader = new InputStreamReader(new BOMInputStream(in))) { 
                 final Model model = mavenreader.read(reader);
                 return new MavenProject(model);
-            }
+            } 
+            //if you don't like BOMInputStream you can also escape the error this way:
+//            catch (XmlPullParserException xppe){
+//               if (! xppe.getMessage().startsWith("only whitespace content allowed before start tag")){
+//                   throw xppe;
+//               } else {
+//                   getLog().debug("The pom.xml starts with a Byte Order Marker and MavenXpp3Reader doesn't like it");
+//               }
+//            }
         } catch (XmlPullParserException | IOException e) {
             getLog().error("An error occurred attempting to read POM", e);
         }
         return null;
     }
 
-    protected void execute(Set<Component> components, Set<Dependency> dependencies) throws MojoExecutionException{
+    protected void execute(Set<Component> components, Set<Dependency> dependencies, MavenProject mavenProject) throws MojoExecutionException{
         try {
             getLog().info(MESSAGE_CREATING_BOM);
             final Bom bom = new Bom();
@@ -679,7 +752,7 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
                 bom.setSerialNumber("urn:uuid:" + UUID.randomUUID().toString());
             }
             if (schemaVersion().getVersion() >= 1.2) {
-                final Metadata metadata = convert(this.project);
+                final Metadata metadata = convert(mavenProject);
                 bom.setMetadata(metadata);
             }
             bom.setComponents(new ArrayList<>(components));
@@ -694,47 +767,46 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
                 return;
             }
 
-            createBom(bom);
+            createBom(bom, mavenProject);
 
-        } catch (ParserConfigurationException | TransformerException | IOException | SAXException e) {
+        } catch (GeneratorException | ParserConfigurationException | TransformerException | IOException | SAXException e) {
             throw new MojoExecutionException("An error occurred executing " + this.getClass().getName() + ": " + e.getMessage(), e);
         }
     }
 
-    private void createBom(Bom bom) throws ParserConfigurationException, IOException, SAXException,
+    private void createBom(Bom bom, MavenProject mavenProject) throws ParserConfigurationException, IOException, SAXException, GeneratorException,
             TransformerException, MojoExecutionException {
         if (outputFormat.trim().equalsIgnoreCase("all") || outputFormat.trim().equalsIgnoreCase("xml")) {
             final BomXmlGenerator bomGenerator = BomGeneratorFactory.createXml(schemaVersion(), bom);
             bomGenerator.generate();
             final String bomString = bomGenerator.toXmlString();
-            final File bomFile = new File(project.getBasedir(), "target/bom.xml");
-            getLog().info(MESSAGE_WRITING_BOM);
+            final File bomFile = new File(mavenProject.getBasedir(), "target/" + outputName + ".xml");
+            getLog().info(String.format(MESSAGE_WRITING_BOM, "XML", bomFile.getAbsolutePath()));
             FileUtils.write(bomFile, bomString, Charset.forName("UTF-8"), false);
 
-            getLog().info(MESSAGE_VALIDATING_BOM);
+            getLog().info(String.format(MESSAGE_VALIDATING_BOM, "XML", bomFile.getAbsolutePath()));
             final XmlParser bomParser = new XmlParser();
             if (!bomParser.isValid(bomFile, schemaVersion())) {
                 throw new MojoExecutionException(MESSAGE_VALIDATION_FAILURE);
             }
             if (!skipAttach) {
-                mavenProjectHelper.attachArtifact(project, "xml", "cyclonedx", bomFile);
+                mavenProjectHelper.attachArtifact(mavenProject, "xml", "cyclonedx", bomFile);
             }
         }
         if (outputFormat.trim().equalsIgnoreCase("all") || outputFormat.trim().equalsIgnoreCase("json")) {
             final BomJsonGenerator bomGenerator = BomGeneratorFactory.createJson(schemaVersion(), bom);
-            bomGenerator.generate();
             final String bomString = bomGenerator.toJsonString();
-            final File bomFile = new File(project.getBasedir(), "target/bom.json");
-            getLog().info(MESSAGE_WRITING_BOM);
+            final File bomFile = new File(mavenProject.getBasedir(), "target/" + outputName + ".json");
+            getLog().info(String.format(MESSAGE_WRITING_BOM, "JSON", bomFile.getAbsolutePath()));
             FileUtils.write(bomFile, bomString, Charset.forName("UTF-8"), false);
 
-            getLog().info(MESSAGE_VALIDATING_BOM);
+            getLog().info(String.format(MESSAGE_VALIDATING_BOM, "JSON", bomFile.getAbsolutePath()));
             final JsonParser bomParser = new JsonParser();
             if (!bomParser.isValid(bomFile, schemaVersion(), false)) {
                 throw new MojoExecutionException(MESSAGE_VALIDATION_FAILURE);
             }
             if (!skipAttach) {
-                mavenProjectHelper.attachArtifact(project, "json", "cyclonedx", bomFile);
+                mavenProjectHelper.attachArtifact(mavenProject, "json", "cyclonedx", bomFile);
             }
         }
     }
@@ -763,8 +835,10 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
             return CycloneDxSchema.Version.VERSION_10;
         } else if (schemaVersion != null && schemaVersion.equals("1.1")) {
             return CycloneDxSchema.Version.VERSION_11;
-        } else {
+        } else if (schemaVersion != null && schemaVersion.equals("1.2")) {
             return CycloneDxSchema.Version.VERSION_12;
+        } else {
+            return CycloneDxSchema.Version.VERSION_13;
         }
     }
 
@@ -840,6 +914,20 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
         }
     }
 
+    protected void addMavenProjectsAsDependencies(List<MavenProject> reactorProjects, Set<Dependency> dependencies) {
+        for (final Dependency dependency: dependencies) {
+            for (final MavenProject project: reactorProjects) {
+                if (project.hasParent()) {
+                    final String parentRef = generatePackageUrl(project.getParentArtifact());
+                    if (dependency.getRef() != null && dependency.getRef().equals(parentRef)) {
+                        final Dependency child = new Dependency(generatePackageUrl(project.getArtifact()));
+                        dependency.addDependency(child);
+                    }
+                }
+            }
+        }
+    }
+
     protected void logParameters() {
         if (getLog().isInfoEnabled()) {
             getLog().info("CycloneDX: Parameters");
@@ -853,8 +941,64 @@ public abstract class BaseCycloneDxMojo extends AbstractMojo {
             getLog().info("includeSystemScope     : " + includeSystemScope);
             getLog().info("includeLicenseText     : " + includeLicenseText);
             getLog().info("outputFormat           : " + outputFormat);
+            getLog().info("outputName             : " + outputName);
             getLog().info("------------------------------------------------------------------------");
         }
     }
 
+    @Override
+    public void contextualize( Context theContext )
+            throws ContextException
+    {
+        this.context = theContext;
+    }
+
+    /**
+     * @return {@link ProjectDependencyAnalyzer}
+     * @throws MojoExecutionException in case of an error.
+     */
+    protected ProjectDependencyAnalyzer createProjectDependencyAnalyzer()
+            throws MojoExecutionException
+    {
+        final String role = ProjectDependencyAnalyzer.ROLE;
+        final String roleHint = analyzer;
+        try
+        {
+            final PlexusContainer container = (PlexusContainer) context.get( PlexusConstants.PLEXUS_KEY );
+            return (ProjectDependencyAnalyzer) container.lookup( role, roleHint );
+        }
+        catch ( Exception exception )
+        {
+            throw new MojoExecutionException( "Failed to instantiate ProjectDependencyAnalyser with role " + role
+                    + " / role-hint " + roleHint, exception );
+        }
+    }
+
+    /**
+     * Method to identify component scope based on dependency analysis
+     *
+     * @param component Component
+     * @param artifact Artifact from maven project
+     * @param dependencyAnalysis Dependency analysis data
+     *
+     * @return Component.Scope - Required: If the component is used. Optional: If it is unused
+     */
+    protected Component.Scope getComponentScope(Component component, Artifact artifact, ProjectDependencyAnalysis dependencyAnalysis) {
+        if (dependencyAnalysis == null) {
+            return null;
+        }
+        Set<Artifact> usedDeclaredArtifacts = dependencyAnalysis.getUsedDeclaredArtifacts();
+        Set<Artifact> usedUndeclaredArtifacts = dependencyAnalysis.getUsedUndeclaredArtifacts();
+        Set<Artifact> unusedDeclaredArtifacts = dependencyAnalysis.getUnusedDeclaredArtifacts();
+        Set<Artifact> testArtifactsWithNonTestScope = dependencyAnalysis.getTestArtifactsWithNonTestScope();
+        // Is the artifact used?
+        if (usedDeclaredArtifacts.contains(artifact) || usedUndeclaredArtifacts.contains(artifact)) {
+            return Component.Scope.REQUIRED;
+        }
+        // Is the artifact unused or test?
+        if (unusedDeclaredArtifacts.contains(artifact) || testArtifactsWithNonTestScope.contains(artifact)) {
+            return Component.Scope.OPTIONAL;
+        }
+        return null;
+    }
 }

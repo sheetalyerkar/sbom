@@ -23,20 +23,28 @@ import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.ResolutionScope;
-import org.apache.maven.shared.dependency.analyzer.ProjectDependencyAnalysis;
+import org.apache.maven.project.MavenProject;
 import org.cyclonedx.model.Component;
 import org.cyclonedx.model.Dependency;
+
+import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.Set;
 
 @Mojo(
-        name = "makeBom",
+        name = "makePackageBom",
         defaultPhase = LifecyclePhase.PACKAGE,
+        threadSafe = true,
+        aggregator = true,
         requiresOnline = true,
         requiresDependencyCollection = ResolutionScope.COMPILE_PLUS_RUNTIME,
         requiresDependencyResolution = ResolutionScope.COMPILE_PLUS_RUNTIME
 )
-public class CycloneDxMojo extends BaseCycloneDxMojo {
+public class CycloneDxPackageMojo extends BaseCycloneDxMojo {
+
+    protected boolean shouldInclude(MavenProject mavenProject) {
+        return Arrays.stream(new String[] {"war", "ear"}).anyMatch(mavenProject.getPackaging()::equals);
+    }
 
     public void execute() throws MojoExecutionException {
         final boolean shouldSkip = Boolean.parseBoolean(System.getProperty("cyclonedx.skip", Boolean.toString(getSkip())));
@@ -44,27 +52,17 @@ public class CycloneDxMojo extends BaseCycloneDxMojo {
             getLog().info("Skipping CycloneDX");
             return;
         }
-        logParameters();
+
         final Set<Component> components = new LinkedHashSet<>();
         final Set<String> componentRefs = new LinkedHashSet<>();
+
         Set<Dependency> dependencies = new LinkedHashSet<>();
-        // Use default dependency analyzer
-        dependencyAnalyzer = createProjectDependencyAnalyzer();
-        getLog().info(MESSAGE_RESOLVING_DEPS);
-        if (getProject() != null && getProject().getArtifacts() != null) {
-            ProjectDependencyAnalysis dependencyAnalysis = null;
-            try {
-                dependencyAnalysis = dependencyAnalyzer.analyze(getProject());
-            } catch (Exception e) {
-                getLog().debug(e);
+        for (final MavenProject mavenProject : getReactorProjects()) {
+            if (!shouldInclude(mavenProject)) {
+                continue;
             }
-
-            // Add reference to BOM metadata component.
-            // Without this, direct dependencies of the Maven project cannot be determined.
-            final Component bomComponent = convert(getProject().getArtifact());
-            componentRefs.add(bomComponent.getBomRef());
-
-            for (final Artifact artifact : getProject().getArtifacts()) {
+            getLog().info("Analyzing " + mavenProject.getArtifactId());
+            for (final Artifact artifact : mavenProject.getArtifacts()) {
                 if (shouldInclude(artifact)) {
                     final Component component = convert(artifact);
                     // ensure that only one component with the same bom-ref exists in the BOM
@@ -75,17 +73,15 @@ public class CycloneDxMojo extends BaseCycloneDxMojo {
                         }
                     }
                     if (!found) {
-                        component.setScope(getComponentScope(component, artifact, dependencyAnalysis));
                         componentRefs.add(component.getBomRef());
                         components.add(component);
                     }
                 }
             }
-        }
-        if (schemaVersion().getVersion() >= 1.2) {
-            dependencies = buildDependencyGraph(componentRefs, null);
+            if (schemaVersion().getVersion() >= 1.2) {
+                dependencies.addAll(buildDependencyGraph(componentRefs, mavenProject));
+            }
         }
         super.execute(components, dependencies, getProject());
     }
-
 }

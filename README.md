@@ -10,9 +10,9 @@
 CycloneDX Maven Plugin
 =========
 
-The CycloneDX Maven plugin creates an aggregate of all dependencies and transitive dependencies of a project 
-and creates a valid CycloneDX bill-of-material document from the results. CycloneDX is a lightweight BOM 
-specification that is easily created, human readable, and simple to parse. 
+The CycloneDX Maven plugin creates an aggregate of all direct and transitive dependencies of a project 
+and creates a valid CycloneDX SBOM. CycloneDX is a lightweight software bill of materials 
+(SBOM) specification designed for use in application security contexts and supply chain component analysis.
 
 Maven Usage
 -------------------
@@ -23,7 +23,7 @@ Maven Usage
     <plugin>
         <groupId>org.cyclonedx</groupId>
         <artifactId>cyclonedx-maven-plugin</artifactId>
-        <version>2.0.0</version>
+        <version>2.5.3</version>
     </plugin>
 </plugins>
 ```
@@ -36,10 +36,10 @@ Default Values
     <plugin>
         <groupId>org.cyclonedx</groupId>
         <artifactId>cyclonedx-maven-plugin</artifactId>
-        <version>2.0.0</version>
+        <version>2.5.3</version>
         <executions>
             <execution>
-                <phase>verify</phase>
+                <phase>package</phase>
                 <goals>
                     <goal>makeAggregateBom</goal>
                 </goals>
@@ -47,7 +47,7 @@ Default Values
         </executions>
         <configuration>
             <projectType>library</projectType>
-            <schemaVersion>1.2</schemaVersion>
+            <schemaVersion>1.3</schemaVersion>
             <includeBomSerialNumber>true</includeBomSerialNumber>
             <includeCompileScope>true</includeCompileScope>
             <includeProvidedScope>true</includeProvidedScope>
@@ -56,20 +56,29 @@ Default Values
             <includeTestScope>false</includeTestScope>
             <includeLicenseText>false</includeLicenseText>
             <outputFormat>all</outputFormat>
+            <outputName>bom</outputName>
         </configuration>
     </plugin>
 </plugins>
 ```
 
+Excluding Projects
+-------------------
+With `makeAggregateBom` goal it is possible to exclude certain Maven Projects (artifactId) from getting included in bom.
+
+* Pass `-DexcludeTestProject=true` to skip any maven project artifactId containing the word "test"
+* Pass `-DexcludeArtifactId=comma separated id` to skip based on artifactId
+
 Notes
 -------------------
-As of v2.0.0, the default CycloneDX BOM format is v1.2 and will produce both XML and JSON. 
+As of v2.5.0, the default CycloneDX BOM format is v1.3 and will produce both XML and JSON.
 
 Goals
 -------------------
-The CycloneDX Maven plugin contains the following two goals:
+The CycloneDX Maven plugin contains the following three goals:
 * makeBom
 * makeAggregateBom
+* makePackageBom
 
 By default, the BOM(s) will be attached as an additional artifacts during a Maven install or deploy.
 
@@ -88,6 +97,7 @@ the CycloneDX version supported by the target system.
 
 | Version | Schema Version | Format(s) |
 | ------- | ----------------- | --------- |
+| 2.5.x | CycloneDX v1.3 | XML/JSON |
 | 2.0.x | CycloneDX v1.2 | XML/JSON |
 | 1.4.x | CycloneDX v1.1 | XML |
 | 1.0x | CycloneDX v1.0 | XML |
@@ -95,7 +105,7 @@ the CycloneDX version supported by the target system.
 Copyright & License
 -------------------
 
-CycloneDX Maven Plugin is Copyright (c) Steve Springett. All Rights Reserved.
+CycloneDX Maven Plugin is Copyright (c) OWASP Foundation. All Rights Reserved.
 
 Permission to modify and redistribute is granted under the terms of the Apache 2.0 license. See the [LICENSE] file for the full license.
 
